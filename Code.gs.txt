@@ -1,0 +1,80 @@
+/**
+ * نرتقي بعلاقاتنا — Google Sheets backend + secure-ish Apps Script admin portal.
+ * Deploy as Web app: execute as me, access anyone. Admin HTML runs on Apps Script origin.
+ * Set Script Properties INITIAL_ADMIN_USERNAME and INITIAL_ADMIN_PASSWORD,
+ * run setupInitialAdmin ONCE from editor, then remove both properties automatically.
+ */
+const SHEETS = {
+  Messages:['id','date','name','relation','school','message','status','fingerprint'],
+  Users:['id','username','displayName','role','salt','passwordHash','active','createdAt'],
+  Sessions:['tokenHash','userId','expiresAt'],
+  WebsiteContent:['key','value','updatedAt','updatedBy'],
+  AuditLog:['date','actor','action','details']
+};
+const DEFAULT_CONTENT={teacher_name:'مها حلواني',teacher_bio:'',teacher_message:'',teacher_vision:'',teacher_photo:'',teacher_title:'معلمة اللغة العربية'};
+function tab_(name){
+  const ss=SpreadsheetApp.getActiveSpreadsheet();let s=ss.getSheetByName(name);
+  if(!s)s=ss.insertSheet(name);
+  if(s.getLastRow()===0)s.appendRow(SHEETS[name]);
+  return s;
+}
+function setupSheets(){Object.keys(SHEETS).forEach(tab_);const sh=tab_('WebsiteContent');const rows=sh.getDataRange().getValues();const keys=new Set(rows.slice(1).map(r=>String(r[0])));Object.keys(DEFAULT_CONTENT).forEach(k=>{if(!keys.has(k))sh.appendRow([k,DEFAULT_CONTENT[k],new Date(),'system']);});}
+function clean_(v,max){let s=String(v==null?'':v).trim().replace(/\s+/g,' ').slice(0,max);if(/^[=+\-@]/.test(s))s="'"+s;return s;}
+function normalize_(v){return String(v||'').normalize('NFKC').replace(/[\u064B-\u065F\u0670\u0640]/g,'').replace(/[أإآ]/g,'ا').replace(/ى/g,'ي').replace(/\s+/g,' ').trim().toLowerCase();}
+function hex_(bytes){return bytes.map(b=>('0'+(b&255).toString(16)).slice(-2)).join('');}
+function sha_(s){return hex_(Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_256,s));}
+function passwordHash_(password,salt){let value=salt+'|'+password;for(let i=0;i<2200;i++)value=sha_(value+'|'+salt);return value;}
+function newToken_(){return Utilities.getUuid().replace(/-/g,'')+Utilities.getUuid().replace(/-/g,'');}
+function audit_(actor,action,details){tab_('AuditLog').appendRow([new Date(),actor,action,String(details||'').slice(0,300)]);}
+function setupInitialAdmin(){
+  const props=PropertiesService.getScriptProperties();const username=String(props.getProperty('INITIAL_ADMIN_USERNAME')||'').trim().toLowerCase();const password=props.getProperty('INITIAL_ADMIN_PASSWORD')||'';
+  if(!/^[a-z0-9_.-]{3,40}$/.test(username)||password.length<12)throw Error('Set INITIAL_ADMIN_USERNAME (3-40 Latin chars) and INITIAL_ADMIN_PASSWORD (12+ chars) in Script Properties first.');
+  setupSheets();const sh=tab_('Users');if(sh.getDataRange().getValues().slice(1).some(r=>r[3]==='super_admin'))throw Error('Super Admin already exists.');
+  const salt=newToken_();sh.appendRow([Utilities.getUuid(),username,'مدير النظام','super_admin',salt,passwordHash_(password,salt),true,new Date()]);
+  props.deleteProperty('INITIAL_ADMIN_USERNAME');props.deleteProperty('INITIAL_ADMIN_PASSWORD');audit_(username,'setup_admin','created');return 'Super Admin created';
+}
+function userRows_(){return tab_('Users').getDataRange().getValues();}
+function login(username,password){
+  username=String(username||'').trim().toLowerCase();password=String(password||'');
+  if(username.length>40||password.length>200||!username||!password)throw Error('بيانات الدخول غير صحيحة');
+  const cache=CacheService.getScriptCache(),key='fail_'+sha_(username).slice(0,24);if(Number(cache.get(key)||0)>=8)throw Error('محاولات كثيرة؛ انتظر 15 دقيقة');
+  const row=userRows_().slice(1).find(r=>String(r[1]).toLowerCase()===username&&String(r[6]).toLowerCase()!=='false');
+  if(!row||passwordHash_(password,String(row[4]))!==String(row[5])){cache.put(key,String(Number(cache.get(key)||0)+1),900);throw Error('اسم المستخدم أو كلمة المرور غير صحيحة');}
+  cache.remove(key);const token=newToken_();const expiry=new Date(Date.now()+8*60*60*1000);tab_('Sessions').appendRow([sha_(token),row[0],expiry]);audit_(username,'login','');
+  return {token,displayName:String(row[2]),role:String(row[3])};
+}
+function current_(token){
+  if(!/^[a-f0-9]{64}$/.test(String(token||'')))throw Error('يرجى تسجيل الدخول');
+  const sessions=tab_('Sessions').getDataRange().getValues();const hit=sessions.slice(1).find(r=>r[0]===sha_(token)&&new Date(r[2]).getTime()>Date.now());
+  if(!hit)throw Error('انتهت الجلسة؛ سجل الدخول مجددًا');
+  const user=userRows_().slice(1).find(r=>r[0]===hit[1]&&String(r[6]).toLowerCase()!=='false');if(!user)throw Error('الحساب غير نشط');
+  return {id:String(user[0]),username:String(user[1]),name:String(user[2]),role:String(user[3])};
+}
+function authorized_(token){const u=current_(token);if(!['super_admin','teacher_admin'].includes(u.role))throw Error('غير مصرح');return u;}
+function logout(token){const hash=sha_(String(token||'')),sh=tab_('Sessions'),rows=sh.getDataRange().getValues();for(let i=rows.length-1;i>=1;i--)if(rows[i][0]===hash)sh.deleteRow(i+1);return true;}
+function content_(){setupSheets();const o={};tab_('WebsiteContent').getDataRange().getValues().slice(1).forEach(r=>{o[String(r[0])]=String(r[1]||'');});return o;}
+function dashboard(token){const u=authorized_(token);const messages=tab_('Messages').getDataRange().getValues().slice(1).reverse().slice(0,250).map(r=>({id:String(r[0]),name:String(r[2]),message:String(r[5]),status:String(r[6]),relation:String(r[3])}));return {user:u,content:content_(),messages};}
+function updateContent(token,key,value){const u=authorized_(token);key=String(key||'');if(!Object.hasOwnProperty.call(DEFAULT_CONTENT,key))throw Error('الحقل غير مسموح');if(key==='teacher_name'&&u.role!=='super_admin')throw Error('اسم المعلمة يحدده مدير النظام فقط');value=clean_(value,3000);if(key==='teacher_name'&&value.length<3)throw Error('اسم المعلمة قصير');const sh=tab_('WebsiteContent'),rows=sh.getDataRange().getValues();let idx=rows.findIndex((r,i)=>i>0&&r[0]===key);if(idx<0)sh.appendRow([key,value,new Date(),u.username]);else sh.getRange(idx+1,2,1,3).setValues([[value,new Date(),u.username]]);audit_(u.username,'content_update',key);return true;}
+function moderateMessage(token,id,status){const u=authorized_(token);if(!['approved','rejected','pending'].includes(status))throw Error('حالة غير صالحة');const sh=tab_('Messages'),rows=sh.getDataRange().getValues();const idx=rows.findIndex((r,i)=>i>0&&String(r[0])===String(id));if(idx<0)throw Error('البصمة غير موجودة');sh.getRange(idx+1,7).setValue(status);audit_(u.username,'moderate_message',id+' '+status);return true;}
+function createTeacher(token,username,displayName,password){const u=current_(token);if(u.role!=='super_admin')throw Error('غير مصرح');username=String(username||'').trim().toLowerCase();displayName=clean_(displayName,100);password=String(password||'');if(!/^[a-z0-9_.-]{3,40}$/.test(username)||displayName.length<3||password.length<12)throw Error('اسم المستخدم بالإنجليزية 3 أحرف على الأقل وكلمة المرور 12 حرفًا على الأقل');const sh=tab_('Users'),rows=userRows_().slice(1);if(rows.some(r=>String(r[1]).toLowerCase()===username))throw Error('اسم المستخدم مستخدم');if(rows.some(r=>r[3]==='teacher_admin'&&String(r[6]).toLowerCase()!=='false'))throw Error('يوجد حساب معلمة نشط بالفعل');const salt=newToken_();sh.appendRow([Utilities.getUuid(),username,displayName,'teacher_admin',salt,passwordHash_(password,salt),true,new Date()]);audit_(u.username,'create_teacher',username);return true;}
+/** Super Admin only: reset the existing teacher password and revoke all teacher sessions. */
+function resetTeacherPassword(token,newPassword){
+  const admin=current_(token);
+  if(admin.role!=='super_admin')throw Error('هذه العملية لمدير النظام فقط');
+  newPassword=String(newPassword||'');
+  if(newPassword.length<12||newPassword.length>200)throw Error('كلمة المرور يجب أن تكون بين 12 و200 حرف');
+  const lock=LockService.getScriptLock();lock.waitLock(20000);
+  try{
+    const sh=tab_('Users'),rows=sh.getDataRange().getValues();
+    const teachers=rows.map((r,i)=>({r,i})).filter(x=>x.i>0&&String(x.r[3])==='teacher_admin'&&String(x.r[6]).toLowerCase()!=='false');
+    if(teachers.length!==1)throw Error('يجب وجود حساب معلمة نشط واحد فقط');
+    const teacher=teachers[0],salt=newToken_();
+    sh.getRange(teacher.i+1,5,1,2).setValues([[salt,passwordHash_(newPassword,salt)]]);
+    const sessions=tab_('Sessions'),sessionRows=sessions.getDataRange().getValues();
+    for(let i=sessionRows.length-1;i>=1;i--)if(String(sessionRows[i][1])===String(teacher.r[0]))sessions.deleteRow(i+1);
+    audit_(admin.username,'reset_teacher_password',String(teacher.r[1]));
+    return {ok:true,username:String(teacher.r[1])};
+  }finally{lock.releaseLock();}
+}
+function doGet(e){const p=e&&e.parameter||{};if(p.portal==='1')return HtmlService.createHtmlOutputFromFile('Admin').setTitle('لوحة التحكم | نرتقي بعلاقاتنا').addMetaTag('viewport','width=device-width, initial-scale=1');const callback=String(p.callback||'');if(!/^[a-zA-Z_$][\w$]{0,80}$/.test(callback))return ContentService.createTextOutput('invalid callback');const action=String(p.action||'list');let data;if(action==='site'){data={ok:true,content:content_()};}else{const rows=tab_('Messages').getDataRange().getValues(),seen=new Set(),entries=[];for(let i=rows.length-1;i>=1;i--){const r=rows[i];if(String(r[6]).toLowerCase()!=='approved')continue;const fp=normalize_(r[2])+'|'+normalize_(r[5]);if(seen.has(fp))continue;seen.add(fp);entries.push({id:String(r[0]),name:String(r[2]),relation:String(r[3]),school:String(r[4]),message:String(r[5])});if(entries.length>=500)break;}data={ok:true,entries};}return ContentService.createTextOutput(callback+'('+JSON.stringify(data)+');').setMimeType(ContentService.MimeType.JAVASCRIPT);}
+function doPost(e){try{const p=e&&e.parameter||{};if(p.website)return ContentService.createTextOutput('ignored');const name=clean_(p.name,60),message=clean_(p.message,1200);if(name.length<2||message.length<10)return ContentService.createTextOutput('invalid');const relation=['طالبة','زميلة','إدارة مدرسية','أخرى'].includes(p.relation)?p.relation:'أخرى';const school=clean_(p.school,100),fp=sha_(normalize_(name)+'|'+normalize_(message));const lock=LockService.getScriptLock();lock.waitLock(20000);try{const sh=tab_('Messages'),rows=sh.getDataRange().getValues();for(let i=1;i<rows.length;i++)if(String(rows[i][7]||sha_(normalize_(rows[i][2])+'|'+normalize_(rows[i][5])))===fp)return ContentService.createTextOutput('duplicate');sh.appendRow([Utilities.getUuid(),new Date(),name,relation,school,message,'pending',fp]);}finally{lock.releaseLock();}return ContentService.createTextOutput('received');}catch(err){console.error(err);return ContentService.createTextOutput('error');}}
